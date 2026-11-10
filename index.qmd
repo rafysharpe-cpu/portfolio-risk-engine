@@ -1,0 +1,146 @@
+---
+title: "Portfolio Risk & Monte Carlo Simulation Engine"
+subtitle: "Fat-Tailed Risk Modeling and 5-Year Horizon Forecasting"
+author: "Rafy Sharpe"
+format:
+  html:
+    theme: cosmo
+    toc: true
+    code-fold: show
+    embed-resources: true
+execute:
+  warning: false
+  message: false
+---
+
+## Executive Summary
+
+This report evaluates historical risk and simulates 5-year forward-looking returns for a multi-asset portfolio. Asset innovations are modeled using a Student's $t$-distribution ($\nu = 5$) to account for leptokurtic behavior and fat-tail crash probabilities observed in financial markets.
+
+## 1. Portfolio Construction & Historical Data
+
+```{r}
+#| label: data-setup
+library(tidyverse)
+library(tidyquant)
+
+weights <- tibble(
+  symbol = c("VT", "GLD", "BTC-USD", "SRFM", "ONDS", "BRK-B", "BIL", "GOOGL"), 
+  weight = c(0.589, 0.124, 0.023, 0.003, 0.032, 0.055, 0.138, 0.036)
+)
+
+portfolio <- tq_get(weights$symbol, from = "2020-01-01", to = "2026-11-10")
+
+returns_data <- portfolio |> 
+  group_by(symbol) |> 
+  tq_transmute(
+    select = adjusted, 
+    mutate_fun = periodReturn, 
+    period = "daily",
+    type = "arithmetic", 
+    col_rename = "daily_return"
+  ) |> 
+  drop_na()
+
+portfolio_returns <- returns_data |> 
+  tq_portfolio(
+    assets_col = symbol, 
+    returns_col = daily_return, 
+    weights = weights, 
+    col_rename = "portfolio_return"
+  )
+```
+
+## 2. Downside Risk Analysis (VaR & Expected Shortfall)
+
+Value at Risk (VaR) is calculated empirically at the 95% confidence level ($\alpha = 0.05$), alongside Conditional Value at Risk (Expected Shortfall):
+
+$$\text{ES}_{\alpha} = \mathbb{E}[R \mid R \le \text{VaR}_{\alpha}]$$
+
+```{r}
+#| label: var-analysis
+var <- quantile(portfolio_returns$portfolio_return, probs = 0.05, na.rm = TRUE)
+
+expected_shortfall <- portfolio_returns |> 
+  filter(portfolio_return < var) |> 
+  summarise(expected_shortfall = mean(portfolio_return))
+
+ggplot(portfolio_returns, aes(x = portfolio_return)) +
+  geom_histogram(bins = 100, aes(fill = portfolio_return > var)) +
+  geom_vline(xintercept = var, color = "black", linewidth = 1.2, linetype = "dashed") +
+  labs(
+    title = "Daily Portfolio Returns and 5% VaR Threshold",
+    x = "Daily Return", 
+    y = "Frequency",
+    fill = "Exceeds 5% VaR"
+  ) +
+  theme_minimal()
+```
+
+## 3. Fat-Tailed Monte Carlo Engine
+
+Asset returns typically exhibit excess kurtosis. Random innovations $T_t$ are sampled from a Student's $t$-distribution with $\nu = 5$ degrees of freedom and scaled to maintain portfolio volatility:
+
+$$Z_t = \mu + \sigma \sqrt{\frac{\nu - 2}{\nu}} \cdot T_t, \quad T_t \sim t(\nu)$$
+
+```{r}
+#| label: monte-carlo-sim
+set.seed(42)
+
+portfolio_stats_return <- portfolio_returns |> 
+  summarize(
+    mean_return = mean(portfolio_return, na.rm = TRUE), 
+    portfolio_sd = sd(portfolio_return, na.rm = TRUE)
+  )
+
+nu <- 5
+log_mean_return <- log(1 + portfolio_stats_return$mean_return) - ((portfolio_stats_return$portfolio_sd)^2) / 2
+log_sd <- portfolio_stats_return$portfolio_sd
+scale_t <- log_sd * sqrt((nu - 2) / nu)
+
+# 10,000 simulations over 1,260 trading days (~5 years)
+portfolio_simulation <- replicate(
+  10000, 
+  exp(cumsum(log_mean_return + scale_t * rt(1260, df = nu))) * 28100
+)
+
+# Plotting sample trajectories
+simulation_sample_tibble <- portfolio_simulation[ , 1:100] |> 
+  as_tibble() |> 
+  mutate(day = 1:1260) |> 
+  pivot_longer(cols = -day, names_to = "simulation_no", values_to = "portfolio_value")
+
+ggplot(simulation_sample_tibble, aes(x = day, y = portfolio_value, group = simulation_no)) +
+  geom_line(alpha = 0.15) +
+  geom_hline(yintercept = 28100, color = "red", linetype = "dashed") +
+  scale_y_continuous(labels = scales::comma) + 
+  theme_minimal() +
+  labs(
+    title = "5-Year Monte Carlo Trajectories (100 Sample Paths)",
+    x = "Trading Days", 
+    y = "Portfolio Value (£)"
+  )
+```
+
+## 4. Key Terminal Risk Metrics
+
+```{r}
+#| label: terminal-metrics
+final_values <- portfolio_simulation[1260, ]
+five_year_var <- quantile(final_values, probs = 0.05, na.rm = TRUE)
+five_year_cvar <- mean(final_values[final_values < five_year_var])
+losing_chance <- mean(final_values < 28100)
+doubling_chance <- mean(final_values > 56200)
+
+tibble(
+  Metric = c("Initial Capital", "5-Year 95% VaR", "5-Year 95% CVaR", "P(Loss at 5 Years)", "P(Doubling Capital)"),
+  Value = c(
+    "£28,100",
+    paste0("£", formatC(five_year_var, format = "f", digits = 2, big.mark = ",")),
+    paste0("£", formatC(five_year_cvar, format = "f", digits = 2, big.mark = ",")),
+    paste0(round(losing_chance * 100, 2), "%"),
+    paste0(round(doubling_chance * 100, 2), "%")
+  )
+) |> 
+  knitr::kable()
+```
